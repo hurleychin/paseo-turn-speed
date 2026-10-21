@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  cacheStats,
   calibrate,
   initialMeterState,
   reduceMeter,
@@ -322,6 +323,127 @@ test("text keys survive turn boundaries", () => {
   s = startTurn(s, 500);
   s = reduceMeter(s, { t: "text", at: 600, key: "m1", text: "hello world!" });
   assert.equal(s.totalChars, 1);
+});
+
+test("cache hit rate uses reported cache reads", () => {
+  // OpenAI-style: `input` already contains the cached tokens.
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 100, key: "m1", text: "a" });
+  s = reduceMeter(s, { t: "usage", at: 1000, usage: { output: 40, input: 10_000, cached: 8_000 } });
+  const sum = summarizeTurn(s, CPT, 1000);
+  assert.equal(sum.inputTokens, 10_000);
+  assert.equal(sum.cachedTokens, 8_000);
+  assert.equal(sum.promptTokens, 10_000);
+  assert.equal(sum.cacheHitRate, 0.8);
+});
+
+test("cache hit rate is null without prompt data and 0 without cache", () => {
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 100, key: "m1", text: "a" });
+  s = reduceMeter(s, { t: "usage", at: 1000, usage: { output: 40 } });
+  assert.equal(summarizeTurn(s, CPT, 1000).cacheHitRate, null);
+  s = reduceMeter(s, { t: "text", at: 1100, key: "m2", text: "b" });
+  s = reduceMeter(s, { t: "usage", at: 2000, usage: { output: 70, input: 900, cached: 0 } });
+  const sum = summarizeTurn(s, CPT, 2000);
+  assert.equal(sum.promptTokens, 900);
+  assert.equal(sum.cacheHitRate, 0);
+});
+
+test("cacheStats separates the two provider prompt shapes", () => {
+  // OpenAI-style: prompt total equals input.
+  assert.deepEqual(cacheStats(1000, 400), { promptTokens: 1000, cachedTokens: 400, hitRate: 0.4 });
+  // Anthropic-style: `input` is the uncached prompt, cache reads are extra.
+  assert.deepEqual(cacheStats(1000, 9000), { promptTokens: 10_000, cachedTokens: 9000, hitRate: 0.9 });
+  // Nothing reported.
+  assert.deepEqual(cacheStats(0, 0), { promptTokens: 0, cachedTokens: 0, hitRate: null });
+  assert.deepEqual(cacheStats(Number.NaN, 500), { promptTokens: 500, cachedTokens: 500, hitRate: 1 });
+});
+
+test("cache writes join the prompt total, so they lower the hit rate", () => {
+  // The Anthropic definition: cacheRead / (newInput + cacheWrite + cacheRead).
+  // Half the prompt is served from cache, half is being written into it.
+  const half = cacheStats(1200, 60_000, "separate", 60_000);
+  assert.equal(half.promptTokens, 121_200);
+  assert.equal(half.cachedTokens, 60_000);
+  assert.equal(half.hitRate, 60_000 / 121_200);
+  assert.ok(half.hitRate !== null && half.hitRate < 0.5);
+
+  // A TTL rebuild that hits nothing: the old formula called this 0% by luck
+  // (cached = 0), the new one keeps 0% for the right reason.
+  const rebuild = cacheStats(1200, 0, "auto", 120_000);
+  assert.equal(rebuild.promptTokens, 121_200);
+  assert.equal(rebuild.hitRate, 0);
+});
+
+test("a zero cache write leaves the rate exactly as before", () => {
+  // Every provider Paseo reports today is in this branch, so the extra term
+  // must not move any number.
+  const withoutTerm = cacheStats(194, 125_056);
+  const withZeroTerm = cacheStats(194, 125_056, "auto", 0);
+  assert.deepEqual(withZeroTerm, withoutTerm);
+  assert.equal(withZeroTerm.promptTokens, 125_250);
+});
+
+test("cache hit rate stays null when the turn reports no prompt at all", () => {
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 100, key: "m1", text: "a" });
+  s = reduceMeter(s, { t: "usage", at: 1000, usage: { output: 40, cacheWrite: 9000 } });
+  const sum = summarizeTurn(s, CPT, 1000);
+  assert.equal(sum.cacheWriteTokens, 9000);
+  assert.equal(sum.promptTokens, 9000);
+  assert.equal(sum.cacheHitRate, 0);
+});
+
+test("cache writes accumulate per step like the other counters", () => {
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 100, key: "m1", text: "a" });
+  s = reduceMeter(s, { t: "usage", at: 900, usage: { output: 10, input: 1000, cached: 0, cacheWrite: 50_000 } });
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m2", text: "b" });
+  s = reduceMeter(s, { t: "usage", at: 1800, usage: { output: 20, input: 1200, cached: 51_000, cacheWrite: 50_000 } });
+  const sum = summarizeTurn(s, CPT, 1800);
+  // Step 2: 1200 new prompt tokens, 51000 cache reads, no new writes.
+  assert.equal(sum.cacheWriteTokens, 50_000);
+  assert.equal(sum.cachedTokens, 51_000);
+  assert.equal(sum.promptTokens, 1200 + 50_000 + 51_000);
+  assert.equal(sum.cacheHitRate, 51_000 / 102_200);
+});
+
+test("cache hit rate accumulates across a turn's steps", () => {
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 100, key: "m1", text: "a" });
+  s = reduceMeter(s, { t: "usage", at: 900, usage: { output: 10, input: 1000, cached: 400 } });
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m2", text: "b" });
+  // Step 2 brings 1200 fresh prompt tokens and 1200 more cache reads.
+  s = reduceMeter(s, { t: "usage", at: 1800, usage: { output: 20, input: 2200, cached: 1600 } });
+  const sum = summarizeTurn(s, CPT, 1800);
+  assert.equal(sum.inputTokens, 2200);
+  assert.equal(sum.cachedTokens, 1600);
+  assert.equal(sum.promptTokens, 2200);
+  assert.equal(sum.cacheHitRate, 1600 / 2200);
+});
+
+test("a cache read larger than the prompt means disjoint counters", () => {
+  // Anthropic-style providers report cache reads outside `inputTokens`.
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 100, key: "m1", text: "a" });
+  s = reduceMeter(s, { t: "usage", at: 1000, usage: { output: 40, input: 900, cached: 9_100 } });
+  const sum = summarizeTurn(s, CPT, 1000);
+  assert.equal(sum.inputTokens, 900);
+  assert.equal(sum.cachedTokens, 9_100);
+  assert.equal(sum.promptTokens, 10_000);
+  assert.equal(sum.cacheHitRate, 0.91);
+});
+
+test("repeated snapshots never inflate the cache hit rate", () => {
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 100, key: "m1", text: "a" });
+  s = reduceMeter(s, { t: "usage", at: 900, usage: { output: 10, input: 1000, cached: 900 } });
+  s = reduceMeter(s, { t: "usage", at: 1000, usage: { output: 10, input: 1000, cached: 900 } });
+  const sum = summarizeTurn(s, CPT, 1000);
+  assert.equal(sum.steps, 1);
+  assert.equal(sum.cachedTokens, 900);
+  assert.equal(sum.promptTokens, 1000);
+  assert.equal(sum.cacheHitRate, 0.9);
 });
 
 test("calibration blends with EMA 0.7/0.3, clamps, and rejects thin samples", () => {

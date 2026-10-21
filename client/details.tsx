@@ -3,7 +3,7 @@ import { useEffect, useMemo, useReducer, useSyncExternalStore } from "react";
 import { Pressable, Text, View } from "react-native";
 import type { PluginButtonContentProps } from "@getpaseo/plugin/client";
 import { useSettings } from "@getpaseo/plugin/client";
-import { approx, fmtDuration, fmtRate, fmtTokPerSec, fmtTokens } from "./format";
+import { approx, fmtDuration, fmtPercent, fmtRate, fmtTokPerSec, fmtTokens } from "./format";
 import type { AgentSpeedStore } from "./store";
 import { EMPTY_TEAM, type TeamView } from "./team";
 import { preferences, type Preferences } from "../shared/preferences";
@@ -168,16 +168,26 @@ export function makeSpeedDetails(
         <Row
           styles={styles}
           label="tokens"
-          value={`in ${fmtTokens(summary.inputTokens, prefs.tokenFormat)} \u00b7 cached ${fmtTokens(
-            summary.cachedTokens,
-            prefs.tokenFormat,
-          )} \u00b7 out ${approx(fmtTokens(summary.estTokens, prefs.tokenFormat), summary.approx)}`}
+          value={`in ${fmtTokens(summary.inputTokens, prefs.tokenFormat)} · out ${approx(
+            fmtTokens(summary.estTokens, prefs.tokenFormat),
+            summary.approx,
+          )}`}
         />
         {summary.thinkingTokens >= 10 ? (
           <Row
             styles={styles}
             label={"thinking \u2248"}
             value={`${approx(fmtTokens(summary.thinkingTokens, prefs.tokenFormat), true)} tok (not in reported out)`}
+          />
+        ) : null}
+        {summary.cacheHitRate !== null ? (
+          <Row
+            styles={styles}
+            label="cache hit"
+            value={`${fmtPercent(summary.cacheHitRate)} · cached ${fmtTokens(
+              summary.cachedTokens,
+              prefs.tokenFormat,
+            )} / ${fmtTokens(summary.promptTokens, prefs.tokenFormat)}`}
           />
         ) : null}
         {state.ctxUsed !== null && state.ctxMax !== null ? (

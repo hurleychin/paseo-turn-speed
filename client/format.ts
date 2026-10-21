@@ -22,6 +22,18 @@ function fmtGrouped(n: number): string {
   return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, "\u2009");
 }
 
+/** 0..1 ratio -> 0% / 3.4% / 86% / 100%. Never rounds up to 100% unless
+ * the rate is genuinely that high: a 99.86% hit rate reads 99.9%. */
+export function fmtPercent(ratio: number | null): string {
+  if (ratio === null || !Number.isFinite(ratio) || ratio < 0) return "—";
+  const pct = ratio * 100;
+  if (pct >= 99.95) return "100%";
+  if (pct >= 99) return `${pct.toFixed(1)}%`;
+  if (pct >= 10) return `${Math.round(pct)}%`;
+  if (pct < 0.05) return "0%";
+  return `${pct.toFixed(1)}%`;
+}
+
 /** 640ms / 12.3s / 2m05s */
 export function fmtDuration(ms: number | null): string {
   if (ms === null || !Number.isFinite(ms) || ms < 0) return "—";

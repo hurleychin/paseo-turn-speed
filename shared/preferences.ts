@@ -17,6 +17,10 @@ export const preferences = defineSettings({
     manualCharsPerToken: z.number().min(1).max(12).nullable().default(null),
     /** Token count rendering: 1.2k or 1 240. */
     tokenFormat: z.enum(["compact", "plain"]).default("compact"),
+    /** Append the turn's prompt cache hit rate to the pill label. */
+    showCacheInPill: z.boolean().default(false),
+    /** How the provider reports cache reads relative to the prompt counter. */
+    cacheCounting: z.enum(["auto", "inclusive", "separate"]).default("auto"),
     /** Usage steps implying a faster decode than this are misattributed
      * (late usage from a previous message) and get dropped from the turn. */
     maxPlausibleTokPerSec: z.number().int().min(50).max(100000).default(400),
