@@ -87,3 +87,8 @@ Other registry-validation rules that bit us:
   separate `/auth/cli/` confirmation for the publish itself (see gotchas).
   Registry bump PR is opened by the bot after the staged publish resolves;
   cafe re-scans automatically.
+- 2026-10-25 — v1.2.0 published: thinking-token accounting (exclusion
+  detection, reasoning-specific 3.7 chars/token estimate, per-model verdict
+  with revocation rules), unattributed-token retention, open-step decode
+  windows, plausibility-capped displayed rates. Same expired-session login
+  flow as v1.1.0; both smoke installs passed.
