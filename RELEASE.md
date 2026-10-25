@@ -92,3 +92,7 @@ Other registry-validation rules that bit us:
   with revocation rules), unattributed-token retention, open-step decode
   windows, plausibility-capped displayed rates. Same expired-session login
   flow as v1.1.0; both smoke installs passed.
+- 2026-10-25 — v1.2.1 published (docs-only): README links the upstream
+  `AgentUsage.reasoningTokens` request (getpaseo/paseo discussion #7863) from
+  Known limitations, so registry listings carry the upvote target. Session
+  still warm from v1.2.0; publish still required its own `/auth/cli/` passkey.
