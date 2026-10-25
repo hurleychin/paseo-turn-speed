@@ -175,6 +175,11 @@ check:client` runs the real Hermes syntax check too.
 
 ## Known limitations
 
+- Providers that subtract thinking from the reported `output` (OpenCode + local
+  reasoning models) get thinking tokens only as an estimate (`thinking ≈`):
+  real per-step reasoning counts never reach the plugin API. Upstream request
+  — your upvote helps:
+  [getpaseo/paseo#7863](https://github.com/getpaseo/paseo/discussions/7863).
 - Usage arrives via agent snapshots, so step boundaries are as fine as the
   provider's per-call usage updates. Providers without usage at all stay `≈`.
 - The plugin only counts what it watches live: after a reload or a reconnect the
