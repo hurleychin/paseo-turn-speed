@@ -1,6 +1,6 @@
 {
   "name": "paseo-turn-speed",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Live decode tok/s, prefill and token breakdown for every agent turn",
   "license": "MIT",
   "author": "Bogdan Yanysh <acidlol@live.ru>",
