@@ -54,6 +54,7 @@ export function summarizeTeam(
   members: readonly TeamMemberInput[],
   windowSec: number,
   now: number,
+  maxTokPerSec?: number,
 ): TeamView {
   const views: TeamMemberView[] = [];
   let running = 0;
@@ -63,7 +64,7 @@ export function summarizeTeam(
   for (const member of members) {
     const isRunning = member.store.isRunning();
     const summary = member.store.summary(now);
-    const liveTokPerSec = isRunning ? member.store.liveTokPerSec(windowSec) : null;
+    const liveTokPerSec = isRunning ? member.store.liveTokPerSec(windowSec, maxTokPerSec) : null;
     views.push({
       id: member.id,
       title: member.title,

@@ -14,7 +14,7 @@ import {
   type MeterStateDoc,
   type Preferences,
 } from "./shared/preferences";
-import { DEFAULT_CHARS_PER_TOKEN } from "./client/meter";
+import { DEFAULT_CHARS_PER_TOKEN, CAL_MAX } from "./client/meter";
 
 // Structural type derivation keeps `@getpaseo/client` out of the client
 // bundle: only types provided through the plugin context are used.
@@ -150,8 +150,20 @@ export default function contribute(client: PluginClientContext) {
         const parsed = meterState.schema.safeParse(read.values);
         if (parsed.success) {
           calibration.clear();
+          const saturated: string[] = [];
           for (const [model, cpt] of Object.entries(parsed.data.calibration)) {
-            calibration.set(model, cpt);
+            // Entries pinned at CAL_MAX were produced by the pre-1.2 bug
+            // that charged reasoning characters against reasoning-free
+            // output tokens: drop them and let them relearn cleanly.
+            if (cpt >= CAL_MAX) saturated.push(model);
+            else calibration.set(model, cpt);
+          }
+          if (saturated.length > 0) {
+            void mutateDoc(meterState, (doc) => {
+              const next = { ...doc.calibration };
+              for (const model of saturated) delete next[model];
+              return { calibration: next };
+            });
           }
         }
       }
@@ -295,6 +307,7 @@ export default function contribute(client: PluginClientContext) {
             at,
             key: `reasoning:${event.turnId ?? "current"}`,
             text: item.text,
+            kind: "reasoning",
           });
         } else if (item.type === "compaction") {
           store.dispatch({ t: "compaction", at });
@@ -457,7 +470,12 @@ export default function contribute(client: PluginClientContext) {
       store.dispatch({ t: should ? "delegated_started" : "delegated_ended", at: Date.now() });
     };
     const team = () => {
-      const view = summarizeTeam(teamMembers(agent.id), prefs.liveWindowSec, Date.now());
+      const view = summarizeTeam(
+        teamMembers(agent.id),
+        prefs.liveWindowSec,
+        Date.now(),
+        prefs.maxPlausibleTokPerSec,
+      );
       // Open sub_agent tool calls count too: on provider subagents (no
       // linked Paseo child) they are the only running signal.
       const running = Math.max(view.running, subCalls.size);

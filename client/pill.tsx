@@ -13,15 +13,20 @@ export interface PillView {
   title: string;
 }
 
-/** Number the pill leads with, per the speed-basis preference. */
+/** Number the pill leads with, per the speed-basis preference. Rates above
+ * the plausibility limit are bookkeeping artifacts, not speed: show nothing
+ * rather than a fabricated burst. */
 function headlineTokPerSec(store: AgentSpeedStore, prefs: Preferences, now: number): number | null {
   const summary = store.summary(now);
+  const plausible = (rate: number | null): number | null =>
+    rate !== null && rate > prefs.maxPlausibleTokPerSec ? null : rate;
   if (store.isRunning() && prefs.numerator === "live") {
-    const live = store.liveTokPerSec(prefs.liveWindowSec);
+    const live = store.liveTokPerSec(prefs.liveWindowSec, prefs.maxPlausibleTokPerSec);
     if (live !== null) return live;
   }
-  if (prefs.numerator === "turn") return summary.tokPerSecTurn ?? summary.tokPerSecDecode;
-  return summary.tokPerSecDecode ?? summary.tokPerSecTurn;
+  if (prefs.numerator === "turn")
+    return plausible(summary.tokPerSecTurn ?? summary.tokPerSecDecode);
+  return plausible(summary.tokPerSecDecode ?? summary.tokPerSecTurn);
 }
 
 export function computePillView(

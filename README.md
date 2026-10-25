@@ -6,7 +6,11 @@ A composer pill per agent that shows how fast the model is actually decoding:
 once the turn ends — with a popover breakdown (prefill/TTFT, in/cached/out
 tokens, steps, tool wait, user wait, per-subagent rates, context occupancy).
 Numbers measured from real provider usage are exact; before the first usage
-event they are character estimates marked with `≈`.
+event they are character estimates marked with `≈`. For reasoning models whose
+provider subtracts thinking from the reported output (measured on OpenCode +
+local models via oMLX), the thinking tokens are estimated from the streamed
+reasoning text and shown as a separate `thinking ≈` line, so rates cover all
+generated tokens instead of only the visible answer.
 
 ## Install
 
@@ -118,8 +122,27 @@ provider config) — it feeds the `context 34k / 131k` line in the popover.
   a note lands in the app log (`turn-speed: step dropped as implausible`).
 - **Auto-calibration** — at every step end the observed `chars/token` ratio for
   the model is blended into a stored per-model calibration (EMA 0.7/0.3, clamped
-  to 2..8, persisted in plugin settings). After 2–3 steps the live estimate
-  tracks the real one closely. Settings → Turn speed shows and can override it.
+  to 2..8, persisted in plugin settings). Samples dominated by tool-call arguments
+  (far fewer visible chars than the step's output tokens) are rejected, so tool
+  runs do not drag the ratio down. After 2–3 steps the live estimate tracks the
+  real one closely. Settings → Turn speed shows and can override it.
+- **Thinking estimate has its own ratio** — reasoning prose encodes ~3.7
+  characters per token (measured against per-step reasoning-token ground truth),
+  so `thinking ≈` divides streamed reasoning characters by that instead of the
+  visible-text calibration.
+- **The exclusion verdict belongs to its model** — detecting that a provider
+  subtracts thinking from `output` is a property of the model behind the agent.
+  Switching models revokes the verdict immediately; a provider config change
+  under the same model (thinking suddenly inside `output`) is caught after
+  three consecutive contradicting steps, and heavy-thinking evidence re-arms it
+  the next step. When the agent's model identity is never reported, the verdict
+  is never permanent: each new turn re-derives it from fresh evidence.
+
+  Caveats: providers that never send usage cannot be judged at all (there is
+  nothing to compare the reasoning text against), and for them a reasoning
+  block delivered in one bulk after the answer text started is deliberately
+  left out of the character estimate — a bulk tells when it arrived, not how
+  long it took to generate. Such turns can be undercounted.
 
 ## Settings (Settings → Plugins → Turn speed)
 
@@ -130,7 +153,7 @@ provider config) — it feeds the `context 34k / 131k` line in the popover.
 | Token format | 1.2k | compact or grouped digits |
 | Live smoothing window | 2 s | averaging window of the live tok/s |
 | Manual chars per token | off (auto-calibrated) | override the live character estimate |
-| Implausible rate limit | 400 tok/s | steps implying a faster decode are dropped as misattributed usage |
+| Implausible rate limit | 400 tok/s | steps implying a faster decode are dropped as misattributed usage; no pill ever shows a rate above the limit |
 
 ## Development
 

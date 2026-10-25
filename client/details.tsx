@@ -87,7 +87,7 @@ export function makeSpeedDetails(
     }, [teamActive]);
     const cpt = charsPerToken();
     const running = state.phase === "running";
-    const live = running ? store.liveTokPerSec(prefs.liveWindowSec) : null;
+    const live = running ? store.liveTokPerSec(prefs.liveWindowSec, prefs.maxPlausibleTokPerSec) : null;
     const basis = settings.status === "ready" ? settings.values.numerator : null;
     const setBasis = (value: "live" | "decode" | "turn") => {
       if (settings.status !== "ready" || settings.values.numerator === value) return;
@@ -101,6 +101,23 @@ export function makeSpeedDetails(
       summary.firstStepPromptTokens !== null && summary.prefillMs !== null && summary.prefillMs > 0
         ? summary.firstStepPromptTokens / (summary.prefillMs / 1000)
         : null;
+    // With a warm prefix cache the model restores the prompt instead of
+    // prefilling it: dividing new tokens by TTFT then measures cache load and
+    // queueing, not prefill speed, so only the honest pieces are shown.
+    const cacheDominant =
+      summary.firstStepCachedTokens !== null &&
+      (summary.firstStepPromptTokens ?? 0) <= summary.firstStepCachedTokens;
+    const prefillValue =
+      summary.prefillMs === null
+        ? null
+        : cacheDominant
+          ? `${fmtTokens(summary.firstStepPromptTokens ?? 0, prefs.tokenFormat)} new + ${fmtTokens(
+              summary.firstStepCachedTokens ?? 0,
+              prefs.tokenFormat,
+            )} cached \u00b7 ${fmtDuration(summary.prefillMs)}`
+          : prefillRate !== null
+            ? `${fmtRate(prefillRate)} tok/s \u00b7 ${fmtDuration(summary.prefillMs)}`
+            : fmtDuration(summary.prefillMs);
     const noUsage = !state.sawUsage && state.phase !== "idle";
 
     const model = store.model ?? store.provider ?? "";
@@ -146,20 +163,23 @@ export function makeSpeedDetails(
           value={fmtTokPerSec(summary.tokPerSecTurn, summary.approx)}
         />
         {summary.prefillMs !== null ? (
-          <Row
-            styles={styles}
-            label="prefill / TTFT"
-            value={`${prefillRate !== null ? `${fmtRate(prefillRate)} tok/s · ` : ""}${fmtDuration(summary.prefillMs)}`}
-          />
+          <Row styles={styles} label="prefill / TTFT" value={prefillValue ?? "\u2014"} />
         ) : null}
         <Row
           styles={styles}
           label="tokens"
-          value={`in ${fmtTokens(summary.inputTokens, prefs.tokenFormat)} · cached ${fmtTokens(
+          value={`in ${fmtTokens(summary.inputTokens, prefs.tokenFormat)} \u00b7 cached ${fmtTokens(
             summary.cachedTokens,
             prefs.tokenFormat,
-          )} · out ${approx(fmtTokens(summary.estTokens, prefs.tokenFormat), summary.approx)}`}
+          )} \u00b7 out ${approx(fmtTokens(summary.estTokens, prefs.tokenFormat), summary.approx)}`}
         />
+        {summary.thinkingTokens >= 10 ? (
+          <Row
+            styles={styles}
+            label={"thinking \u2248"}
+            value={`${approx(fmtTokens(summary.thinkingTokens, prefs.tokenFormat), true)} tok (not in reported out)`}
+          />
+        ) : null}
         {state.ctxUsed !== null && state.ctxMax !== null ? (
           <Row
             styles={styles}

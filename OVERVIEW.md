@@ -11,7 +11,12 @@ turn latency. When the provider reports real usage (for OpenCode/MLX models
 enable `options.includeUsage: true` in the provider config), numbers are exact.
 Without usage the plugin estimates tokens from streamed characters, marks them
 with `≈`, and auto-calibrates a per-model chars/token ratio from every step that
-does report usage.
+does report usage. Reasoning models whose provider subtracts thinking from the
+reported output are detected automatically; their rates include an estimate of
+the thinking tokens (streamed reasoning characters converted with a measured
+reasoning-specific chars/token ratio), and the popover shows it as a separate
+`thinking ≈` line. The verdict is per model: switching models or a provider
+config that starts including thinking revokes it, so nothing is double-counted.
 
 Options live under Settings → Plugins → Turn speed: what the pill leads with
 (live estimate, decode-window average, or whole-turn rate, switchable from the

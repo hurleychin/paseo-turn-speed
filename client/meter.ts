@@ -21,6 +21,24 @@
  * whole-turn rate — the subagents' own pills carry their speed — but it stays
  * inside decode/wait windows, because a delegated call is just another tool
  * run between the agent's model calls.
+ *
+ * Thinking tokens: some providers (measured on OpenCode + local reasoning
+ * models) report `output` with the reasoning tokens subtracted while the
+ * thinking itself streams as reasoning text and its decode time sits in the
+ * step window. Counting only `output` then under-reports rates by the whole
+ * thinking share. When a closed step shows far more reasoning characters
+ * than its output tokens could pay for, the meter marks the turn as
+ * `thinkingExcluded` and credits an estimate of the thinking tokens (reasoning
+ * characters divided by the reasoning-specific chars/token ratio, measured
+ * well above the visible-text one), marked approximate: reasoning that streamed
+ * from the step start covers its own window time and enters the decode rate;
+ * reasoning delivered as a late bulk (after the step's visible text began)
+ * has no measured time, so it only enters turn totals and the whole-turn
+ * rate. Providers that report thinking inside `output` never trigger this.
+ *
+ * Usage deltas the plausibility guard rejects are not dropped: they land in
+ * `unattributedTokens`, counted in token totals and the whole-turn rate
+ * without a decode window of their own.
  */
 
 /** A live-window text gap longer than this is treated as a stall. */
@@ -36,6 +54,32 @@ const MAX_TEXT_KEYS = 32;
 export const CAL_MIN = 2;
 export const CAL_MAX = 8;
 export const CAL_MIN_CHARS = 40;
+/** A closed step whose reasoning characters exceed its output tokens by this
+ * much cannot be reporting thinking inside `output`: mark the turn as one
+ * where the provider excludes reasoning tokens from the reported numbers. */
+export const EXCLUDED_EVIDENCE_RATIO = 8;
+/** Below this many reasoning characters the evidence above is too noisy. */
+export const EXCLUDED_MIN_CHARS = 200;
+/** Reasoning prose encodes more characters per token than visible answers,
+ * and the calibrated visible ratio is additionally biased low: usage
+ * `output` counts tool-call arguments, which never stream as text. Measured
+ * across ~41k reasoning tokens of real OpenCode + local reasoning sessions:
+ * streamed reasoning text runs ~3.7 characters per reasoning token, so the
+ * thinking estimate uses this dedicated ratio instead of the model's
+ * visible-text calibration. */
+export const REASONING_CHARS_PER_TOKEN = 3.7;
+/** A closed step whose reported output tokens already pay for its streamed
+ * reasoning characters — at most 1.4× the reasoning ratio, headroom for
+ * token-dense prose — says thinking is inside `output`: excluded heavy
+ * thinking could not be this cheap to report. Between this and
+ * EXCLUDED_EVIDENCE_RATIO sits a neutral band that concludes nothing. A
+ * single such step can also be a tool-heavy fluke on an excluding provider,
+ * so a streak of them is needed to revoke the verdict — e.g. after the
+ * provider config started including usage differently. One excluding-style
+ * step re-arms it, so a wrong revocation costs at most a step of
+ * undercounting; without revocation a wrong verdict double-counts forever. */
+export const INCLUSION_EVIDENCE_RATIO = REASONING_CHARS_PER_TOKEN * 1.4;
+export const INCLUSION_EVIDENCE_STEPS = 3;
 
 export interface UsageSnapshot {
   input?: number | null;
@@ -56,6 +100,13 @@ export interface StepRecord {
   inputTokens: number;
   /** Cached prompt tokens this call reported. */
   cachedTokens: number;
+  /** Reasoning characters streamed during this step (thinking estimate). */
+  thinkingChars: number;
+  /** The subset that arrived late (after the step's visible text started):
+   * a bulk delivery of the reasoning block, whose generation time the step
+   * window never saw. Their tokens count in turn totals but not in the
+   * decode-window rate. */
+  thinkingLateChars: number;
   /** Prefill/TTFT measured on the first step only, else 0. */
   prefillMs: number;
 }
@@ -78,6 +129,11 @@ export interface MeterState {
   lastTextAt: number | null;
   /** First text since the last step boundary (null = re-anchored). */
   stepFirstTextAt: number | null;
+  /** First visible-text and first reasoning growth since the step boundary.
+   * Their order tells streamed thinking (window-covering) from a late bulk
+   * delivery of a reasoning block (whose generation time the window misses). */
+  stepFirstVisibleAt: number | null;
+  stepFirstReasoningAt: number | null;
   /** Usage arrival of the last completed step. */
   prevStepEndAt: number | null;
   /** Per-message observed text length (snapshot vs delta normalised). */
@@ -99,6 +155,24 @@ export interface MeterState {
   liveChars: number;
   /** All characters streamed this turn (fallback estimate). */
   totalChars: number;
+  /** Reasoning-only characters since the last step boundary (⊆ liveChars). */
+  liveReasoningChars: number;
+  /** Reasoning-only characters streamed this turn (⊆ totalChars). */
+  totalReasoningChars: number;
+  /** Usage tokens the plausibility guard rejected, kept for whole-turn totals. */
+  unattributedTokens: number;
+  /** Set once a step showed reasoning characters no `output` figure could
+   * pay for: this provider excludes thinking from its reported output, so
+   * rates add an estimate from the streamed reasoning text. */
+  thinkingExcluded: boolean;
+  /** Model id (`model_changed`) the verdict belongs to: an exclusion is a
+   * provider-model property, so switching to a model that reports thinking
+   * inside `output` must not double-count it. Null while the identity was
+   * not yet known when the verdict was learned. */
+  thinkingExcludedModel: string | null;
+  /** Consecutive closed steps whose `output` already paid for the streamed
+   * reasoning characters; enough of them revoke a stale verdict. */
+  inclusionStreak: number;
   /** Completed user-wait intervals inside this turn. */
   userWaits: readonly UserWaitInterval[];
   /** Start of the open user-wait interval, null when the model is live. */
@@ -119,7 +193,7 @@ export interface MeterState {
 
 export type MeterAction =
   | { t: "turn_started"; at: number; turnId: string | null }
-  | { t: "text"; at: number; key: string; text: string }
+  | { t: "text"; at: number; key: string; text: string; kind?: "text" | "reasoning" }
   | { t: "usage"; at: number; usage: UsageSnapshot; maxTokPerSec?: number }
   | { t: "compaction"; at: number }
   /** The model blocked on the user (question asked, permission pending). */
@@ -131,6 +205,9 @@ export type MeterAction =
   /** All subagents finished: the agent works alone again. */
   | { t: "delegated_ended"; at: number }
   | { t: "turn_ended"; at: number; kind: "completed" | "failed" | "canceled"; usage?: UsageSnapshot; maxTokPerSec?: number; note?: string | null }
+  /** The agent switched model (or its identity just became known): a
+   * thinking-exclusion verdict learned on another model must not carry. */
+  | { t: "model_changed"; model: string | null }
   /** Drop the locally observed turn (epoch replacement, reconnect, reload). */
   | { t: "reset" };
 
@@ -142,6 +219,8 @@ export function initialMeterState(): MeterState {
     firstTextAt: null,
     lastTextAt: null,
     stepFirstTextAt: null,
+    stepFirstVisibleAt: null,
+    stepFirstReasoningAt: null,
     prevStepEndAt: null,
     textLens: {},
     textTails: {},
@@ -156,6 +235,12 @@ export function initialMeterState(): MeterState {
     steps: [],
     liveChars: 0,
     totalChars: 0,
+    liveReasoningChars: 0,
+    totalReasoningChars: 0,
+    unattributedTokens: 0,
+    thinkingExcluded: false,
+    thinkingExcludedModel: null,
+    inclusionStreak: 0,
     userWaits: [],
     pausedAt: null,
     delegatedWaits: [],
@@ -207,7 +292,13 @@ function growText(
   return { lens, tails, growth };
 }
 
-function applyText(state: MeterState, at: number, key: string, text: string): MeterState {
+function applyText(
+  state: MeterState,
+  at: number,
+  key: string,
+  text: string,
+  isReasoning: boolean,
+): MeterState {
   if (state.phase !== "running" || text.length === 0) return state;
   const { lens, tails, growth } = growText(state, key, text);
   if (growth <= 0) return state;
@@ -217,9 +308,15 @@ function applyText(state: MeterState, at: number, key: string, text: string): Me
     textTails: tails,
     firstTextAt: state.firstTextAt === null ? at : state.firstTextAt,
     stepFirstTextAt: state.stepFirstTextAt === null ? at : state.stepFirstTextAt,
+    stepFirstVisibleAt:
+      !isReasoning && state.stepFirstVisibleAt === null ? at : state.stepFirstVisibleAt,
+    stepFirstReasoningAt:
+      isReasoning && state.stepFirstReasoningAt === null ? at : state.stepFirstReasoningAt,
     lastTextAt: at,
     liveChars: state.liveChars + growth,
     totalChars: state.totalChars + growth,
+    liveReasoningChars: isReasoning ? state.liveReasoningChars + growth : state.liveReasoningChars,
+    totalReasoningChars: isReasoning ? state.totalReasoningChars + growth : state.totalReasoningChars,
   };
 }
 
@@ -348,6 +445,9 @@ function applyUsage(
     return {
       ...withCounters,
       calibInput: null,
+      // Real tokens with no trustworthy window of their own: keep them in
+      // the turn totals instead of letting them vanish from every rate.
+      unattributedTokens: state.unattributedTokens + outDelta.amount,
       stepRejected: { tokens: outDelta.amount, windowMs: stepDecodeMs },
     };
   }
@@ -355,23 +455,59 @@ function applyUsage(
     state.steps.length === 0 && state.firstTextAt !== null && state.startedAt !== null
       ? Math.max(0, state.firstTextAt - state.startedAt)
       : 0;
+  // Reasoning that showed up only after this step's visible text was already
+  // streaming is a bulk delivery of the finished block: the window missed
+  // its generation. Reasoning that led (or carried) the window covered it.
+  const reasoningLate =
+    state.liveReasoningChars > 0 &&
+    state.stepFirstVisibleAt !== null &&
+    (state.stepFirstReasoningAt === null || state.stepFirstReasoningAt > state.stepFirstVisibleAt);
   const step: StepRecord = {
     outTokens: outDelta.amount,
     decodeMs: stepDecodeMs,
     waitMs: stepWaitMs,
     inputTokens: inDelta.amount,
     cachedTokens: cachedDelta.amount,
+    thinkingChars: state.liveReasoningChars,
+    thinkingLateChars: reasoningLate ? state.liveReasoningChars : 0,
     prefillMs,
   };
+  // More streamed reasoning characters than this step's output tokens could
+  // possibly contain: the provider subtracts thinking from `output`.
+  const thinkingEvidence =
+    state.liveReasoningChars >= EXCLUDED_MIN_CHARS &&
+    state.liveReasoningChars > outDelta.amount * EXCLUDED_EVIDENCE_RATIO;
+  // The opposite signal: this step streamed meaningful reasoning yet its
+  // reported output tokens alone already pay for those characters, meaning
+  // the thinking is inside `output`. A single such step can also be a
+  // tool-heavy step on an excluding provider, so a streak of them is needed
+  // to revoke the verdict; one excluding-style step re-arms it.
+  const inclusionEvidence =
+    state.thinkingExcluded &&
+    !thinkingEvidence &&
+    state.liveReasoningChars >= EXCLUDED_MIN_CHARS &&
+    state.liveReasoningChars <= outDelta.amount * INCLUSION_EVIDENCE_RATIO;
+  const inclusionStreak = inclusionEvidence ? state.inclusionStreak + 1 : 0;
+  const revoked = inclusionStreak >= INCLUSION_EVIDENCE_STEPS;
   return {
     ...withCounters,
     steps: [...state.steps, step],
     stepFirstTextAt: null,
+    stepFirstVisibleAt: null,
+    stepFirstReasoningAt: null,
     prevStepEndAt: at,
     liveChars: 0,
+    liveReasoningChars: 0,
     sawUsage: true,
+    thinkingExcluded: revoked ? false : state.thinkingExcluded || thinkingEvidence,
+    inclusionStreak: revoked ? 0 : inclusionStreak,
     stepRejected: null,
-    calibInput: { chars: state.liveChars, tokens: outDelta.amount },
+    // Calibration pairs visible characters with visible tokens: reasoning
+    // text must not enter it, or the ratio saturates against excluded output.
+    calibInput: {
+      chars: state.liveChars - state.liveReasoningChars,
+      tokens: outDelta.amount,
+    },
   };
 }
 
@@ -414,16 +550,34 @@ export function reduceMeter(state: MeterState, action: MeterAction): MeterState 
         prevUsageOut: state.prevUsageOut,
         prevUsageIn: state.prevUsageIn,
         prevUsageCached: state.prevUsageCached,
+        // A provider-level property: survives turns like the usage baseline
+        // — but only when it has a known owner. A verdict that never got a
+        // model identity cannot tell an unchanged provider from an invisible
+        // model switch, so each new turn re-derives it from fresh evidence.
+        thinkingExcluded:
+          state.thinkingExcludedModel === null ? false : state.thinkingExcluded,
+        thinkingExcludedModel: state.thinkingExcludedModel,
+        inclusionStreak: state.thinkingExcludedModel === null ? 0 : state.inclusionStreak,
       };
     }
     case "text":
-      return applyText(state, action.at, action.key, action.text);
+      return applyText(
+        state,
+        action.at,
+        action.key,
+        action.text,
+        action.kind === "reasoning" ||
+          // Backwards compatibility with callers using the legacy key scheme.
+          (action.kind === undefined && action.key.startsWith("reasoning")),
+      );
     case "usage":
       return applyUsage(state, action.at, action.usage, action.maxTokPerSec);
     case "compaction":
       // Context was rewritten; streamed chars since the last step no longer
       // map to answer tokens. Drop the live window, keep step history.
-      return state.phase === "running" ? { ...state, liveChars: 0 } : state;
+      return state.phase === "running"
+        ? { ...state, liveChars: 0, liveReasoningChars: 0 }
+        : state;
     case "user_wait_started":
       return state.phase === "running" && state.pausedAt === null
         ? { ...state, pausedAt: action.at }
@@ -451,7 +605,29 @@ export function reduceMeter(state: MeterState, action: MeterAction): MeterState 
         prevUsageOut: state.prevUsageOut,
         prevUsageIn: state.prevUsageIn,
         prevUsageCached: state.prevUsageCached,
+        thinkingExcluded: state.thinkingExcluded,
+        thinkingExcludedModel: state.thinkingExcludedModel,
+        inclusionStreak: state.inclusionStreak,
       };
+    case "model_changed": {
+      const model = action.model;
+      // An unknown identity must never clear a learned verdict: the model
+      // simply is not on record yet.
+      if (model === null || model === state.thinkingExcludedModel) return state;
+      // A verdict learned before identity was known belongs to it: adopt
+      // rather than revoke, the first concrete model is what we observed.
+      if (state.thinkingExcluded && state.thinkingExcludedModel === null) {
+        return { ...state, thinkingExcludedModel: model };
+      }
+      // Another model: the exclusion verdict was its property, not this
+      // model's. Steps of the current turn stay; only the verdict resets.
+      return {
+        ...state,
+        thinkingExcluded: false,
+        thinkingExcludedModel: model,
+        inclusionStreak: 0,
+      };
+    }
     default:
       return state;
   }
@@ -492,6 +668,14 @@ export interface TurnSummary {
   cachedTokens: number;
   /** Prompt tokens of the first step, for the prefill rate. */
   firstStepPromptTokens: number | null;
+  /** Cached prompt tokens of the first step: with a warm cache the prompt
+   * was restored, not prefilled, so the prefill rate is hidden then. */
+  firstStepCachedTokens: number | null;
+  /** Thinking tokens estimated from streamed reasoning characters (0 when
+   * the provider reports thinking inside `output` or none was streamed). */
+  thinkingTokens: number;
+  /** Tokens from rejected usage bursts, counted in totals without a window. */
+  unattributedTokens: number;
 }
 
 export function summarizeTurn(state: MeterState, charsPerToken: number, now: number): TurnSummary {
@@ -499,24 +683,64 @@ export function summarizeTurn(state: MeterState, charsPerToken: number, now: num
   const inputTokens = state.steps.reduce((sum, s) => sum + s.inputTokens, 0);
   const cachedTokens = state.steps.reduce((sum, s) => sum + s.cachedTokens, 0);
   const waitMs = state.steps.reduce((sum, s) => sum + s.waitMs, 0);
+  const hasReal = state.sawUsage && realOut > 0;
   // Without any usage step there is no anchored window; the span of streamed
   // text stands in for it so estimate-only providers still get a decode rate.
+  // While a step is open, its streamed characters already sit in `estTokens`
+  // (as the tail estimate), so the running window from its first text counts
+  // in the decode denominator too: freezing it at the closed steps would
+  // divide a growing token count by stale windows and print a burst rate.
+  const openWindowMs =
+    state.phase === "running" && state.stepFirstTextAt !== null && state.liveChars > 0
+      ? Math.max(
+          0,
+          now - state.stepFirstTextAt - waitOverlap(state, state.stepFirstTextAt, now),
+        )
+      : 0;
   const decodeMs =
     state.steps.length > 0
-      ? state.steps.reduce((sum, s) => sum + s.decodeMs, 0)
+      ? state.steps.reduce((sum, s) => sum + s.decodeMs, 0) + openWindowMs
       : state.firstTextAt !== null && state.lastTextAt !== null
         ? Math.max(0, state.lastTextAt - state.firstTextAt)
         : 0;
-  const hasReal = state.sawUsage && realOut > 0;
-  const tailEst = state.liveChars / charsPerToken;
-  const wholeEst = state.totalChars / charsPerToken;
+  // Thinking estimate for providers detected as excluding reasoning from
+  // `output`: reasoning characters converted with the reasoning-specific
+  // chars/token ratio (visible-text calibration is biased by tool args).
+  // Early thinking (reasoning led the step window) both adds tokens and was
+  // paid for by window time; late bulks add tokens only, so they may count
+  // in turn totals but never in the decode-window rate.
+  const stepThinkingChars = state.steps.reduce((sum, s) => sum + s.thinkingChars, 0);
+  const earlyThinking = state.thinkingExcluded
+    ? state.steps.reduce((sum, s) => sum + (s.thinkingChars - s.thinkingLateChars), 0) /
+      REASONING_CHARS_PER_TOKEN
+    : 0;
+  const lateThinking = state.thinkingExcluded
+    ? state.steps.reduce((sum, s) => sum + s.thinkingLateChars, 0) / REASONING_CHARS_PER_TOKEN
+    : 0;
+  // Live reasoning characters enter the tail estimate only while reasoning
+  // leads the open step (its arrival was paced with generation). A trailing
+  // bulk of a finished reasoning block would fake a token burst.
+  const liveReasoningEarly =
+    state.stepFirstReasoningAt !== null &&
+    (state.stepFirstVisibleAt === null || state.stepFirstReasoningAt <= state.stepFirstVisibleAt);
+  const thinkingTokens = state.thinkingExcluded && hasReal
+    ? (stepThinkingChars + (liveReasoningEarly ? state.liveReasoningChars : 0)) /
+      REASONING_CHARS_PER_TOKEN
+    : 0;
+  const tailEst =
+    (state.liveChars - state.liveReasoningChars) / charsPerToken +
+    (liveReasoningEarly ? state.liveReasoningChars / REASONING_CHARS_PER_TOKEN : 0);
+  const wholeEst =
+    (state.totalChars - state.totalReasoningChars) / charsPerToken +
+    (state.totalReasoningChars - (liveReasoningEarly ? 0 : state.liveReasoningChars)) /
+      REASONING_CHARS_PER_TOKEN;
   let outTokens: number | null = null;
   let estTokens: number;
   let approx: boolean;
   if (hasReal) {
     outTokens = realOut;
-    estTokens = realOut + tailEst;
-    approx = state.liveChars > 0;
+    estTokens = realOut + earlyThinking + lateThinking + tailEst + state.unattributedTokens;
+    approx = state.liveChars > 0 || earlyThinking + lateThinking > 0 || state.unattributedTokens > 0;
   } else {
     estTokens = wholeEst;
     approx = true;
@@ -543,10 +767,14 @@ export function summarizeTurn(state: MeterState, charsPerToken: number, now: num
     totalMs !== null && state.startedAt !== null && end !== null
       ? Math.max(0, totalMs - unionOverlapMs(asleep, state.startedAt, end))
       : null;
+  // Rejected bursts and late thinking bulks have no decode window of their
+  // own, so they count in the whole-turn totals but never inflate the
+  // decode-window rate.
+  const decodeTokens = hasReal ? estTokens - state.unattributedTokens - lateThinking : estTokens;
   const tokPerSecDecode =
-    decodeMs > 0 && estTokens > 0 ? (outTokens ?? estTokens) / (decodeMs / 1000) : null;
+    decodeMs > 0 && decodeTokens > 0 ? decodeTokens / (decodeMs / 1000) : null;
   const tokPerSecTurn =
-    activeMs !== null && activeMs > 0 && estTokens > 0 ? (outTokens ?? estTokens) / (activeMs / 1000) : null;
+    activeMs !== null && activeMs > 0 && estTokens > 0 ? estTokens / (activeMs / 1000) : null;
   return {
     outTokens,
     estTokens,
@@ -565,6 +793,9 @@ export function summarizeTurn(state: MeterState, charsPerToken: number, now: num
     inputTokens,
     cachedTokens,
     firstStepPromptTokens: state.steps.length > 0 && state.steps[0].inputTokens > 0 ? state.steps[0].inputTokens : null,
+    firstStepCachedTokens: state.steps.length > 0 && state.steps[0].cachedTokens > 0 ? state.steps[0].cachedTokens : null,
+    thinkingTokens,
+    unattributedTokens: state.unattributedTokens,
   };
 }
 
@@ -579,7 +810,12 @@ export function calibrate(
 ): number | null {
   if (!(tokens > 0) || !(chars >= minChars)) return null;
   const observed = chars / tokens;
-  if (!Number.isFinite(observed) || observed < 1) return null;
+  // Below 1.5 char/token the sample is dominated by tool-call arguments
+  // (counted in `output` but never streamed as text), not this model's text
+  // ratio; above 12 it is usage bookkeeping noise (misattributed deltas).
+  // Either end poisons the EMA toward the clamps (a single 20+ sample used to
+  // pin the blend at CAL_MAX).
+  if (!Number.isFinite(observed) || observed < 1.5 || observed > 12) return null;
   const base = typeof prev === "number" && Number.isFinite(prev) ? prev : DEFAULT_CHARS_PER_TOKEN;
   const next = 0.7 * base + 0.3 * observed;
   return Math.min(CAL_MAX, Math.max(CAL_MIN, next));

@@ -5,6 +5,7 @@ import {
   initialMeterState,
   reduceMeter,
   summarizeTurn,
+  REASONING_CHARS_PER_TOKEN,
   type MeterState,
 } from "./meter";
 
@@ -333,7 +334,13 @@ test("calibration blends with EMA 0.7/0.3, clamps, and rejects thin samples", ()
   // Tool-argument-heavy steps stream almost no visible text: too thin.
   assert.equal(calibrate(4, 20, 50), null);
   assert.equal(calibrate(4, 400, 0), null);
-  assert.equal(calibrate(4, 100, 100), 0.7 * 4 + 0.3 * 1); // observed 1 kept, clamped later
+  // A 1-char/token sample is tool-call arguments counted in `output`, not
+  // this model's text ratio: reject instead of dragging the blend down.
+  assert.equal(calibrate(4, 100, 100), null);
+  assert.equal(calibrate(4, 160, 100), 0.7 * 4 + 0.3 * 1.6); // observed 1.5+ kept
+  // A 40-chars/token sample is bookkeeping noise, not a model ratio: reject
+  // instead of letting one step pin the blend at CAL_MAX.
+  assert.equal(calibrate(4, 4000, 100), null);
 });
 
 test("delegated intervals are removed from the whole-turn rate", () => {
@@ -390,4 +397,249 @@ test("delegation outside a running turn is a no-op", () => {
   assert.equal(reduceMeter(idle, { t: "delegated_ended", at: 100 }), idle);
   const running = startTurn();
   assert.equal(reduceMeter(running, { t: "delegated_ended", at: 100 }), running);
+});
+
+test("a provider that excludes reasoning gets estimated thinking tokens", () => {
+  // Heavy thinking streamed as reasoning text, a short answer, then the step
+  // usage: 2400 chars cannot come from 47 reported output tokens.
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 500, key: "reasoning:t1", text: "t".repeat(2400), kind: "reasoning" });
+  s = reduceMeter(s, { t: "text", at: 3000, key: "m1", text: "a".repeat(30) });
+  s = reduceMeter(s, { t: "usage", at: 3100, usage: { output: 47 } });
+  assert.equal(s.thinkingExcluded, true);
+  assert.equal(s.steps[0].thinkingChars, 2400);
+  const sum = summarizeTurn(s, CPT, 3100);
+  // Reasoning characters convert with the reasoning ratio, not the visible
+  // text calibration: measured ~3.7 chars per reasoning token.
+  assert.equal(sum.thinkingTokens, 2400 / REASONING_CHARS_PER_TOKEN);
+  assert.equal(sum.outTokens, 47);
+  assert.equal(sum.estTokens, 47 + 2400 / REASONING_CHARS_PER_TOKEN);
+  assert.equal(sum.approx, true);
+  // The rate covers thinking + visible tokens across the full step window.
+  assert.equal(sum.tokPerSecDecode, (47 + 2400 / REASONING_CHARS_PER_TOKEN) / 2.6);
+});
+
+test("the excluded-reasoning verdict survives turn boundaries like the baseline", () => {
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 500, key: "r1", text: "y".repeat(400), kind: "reasoning" });
+  s = reduceMeter(s, { t: "usage", at: 600, usage: { output: 10 } });
+  assert.equal(s.thinkingExcluded, true);
+  s = reduceMeter(s, { t: "model_changed", model: "m1" });
+  assert.equal(s.thinkingExcludedModel, "m1");
+  s = startTurn(s, 5000);
+  assert.equal(s.thinkingExcluded, true);
+  assert.equal(s.thinkingExcludedModel, "m1");
+  const fresh = reduceMeter(s, { t: "reset" });
+  assert.equal(fresh.thinkingExcluded, true);
+  assert.equal(fresh.thinkingExcludedModel, "m1");
+});
+
+test("the verdict belongs to its model: switching models revokes it, inclusive output is not double counted", () => {
+  let s = startTurn();
+  s = reduceMeter(s, { t: "model_changed", model: "excluder" });
+  s = reduceMeter(s, { t: "text", at: 500, key: "r1", text: "t".repeat(2400), kind: "reasoning" });
+  s = reduceMeter(s, { t: "text", at: 3000, key: "m1", text: "a".repeat(30) });
+  s = reduceMeter(s, { t: "usage", at: 3100, usage: { output: 47 } });
+  assert.equal(s.thinkingExcluded, true);
+  assert.equal(s.thinkingExcludedModel, "excluder");
+  // Switch to a model that reports thinking inside `output`.
+  s = reduceMeter(s, { t: "model_changed", model: "includer" });
+  assert.equal(s.thinkingExcluded, false);
+  assert.equal(s.steps.length, 1); // the current turn's steps survive
+  // Heavy thinking whose reported output already pays for it: no estimate on
+  // top (that would count the thinking twice), and no false re-arm.
+  s = reduceMeter(s, { t: "text", at: 3300, key: "r2", text: "t".repeat(2400), kind: "reasoning" });
+  s = reduceMeter(s, { t: "usage", at: 5200, usage: { output: 695 } });
+  assert.equal(s.thinkingExcluded, false);
+  assert.equal(s.steps.length, 2);
+  const sum = summarizeTurn(s, CPT, 5300);
+  assert.equal(sum.thinkingTokens, 0);
+  assert.equal(sum.estTokens, 695);
+  // Switching back starts unjudged; the verdict only comes back with evidence.
+  s = reduceMeter(s, { t: "model_changed", model: "excluder" });
+  assert.equal(s.thinkingExcluded, false);
+  assert.equal(s.thinkingExcludedModel, "excluder");
+});
+
+test("an unknown model never clears the verdict, and a verdict predating identity adopts the first model", () => {
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 500, key: "r1", text: "y".repeat(600), kind: "reasoning" });
+  s = reduceMeter(s, { t: "usage", at: 600, usage: { output: 10 } });
+  assert.equal(s.thinkingExcluded, true);
+  assert.equal(s.thinkingExcludedModel, null);
+  assert.equal(reduceMeter(s, { t: "model_changed", model: null }), s);
+  const adopted = reduceMeter(s, { t: "model_changed", model: "m1" });
+  assert.equal(adopted.thinkingExcluded, true); // adopted, not revoked
+  assert.equal(adopted.thinkingExcludedModel, "m1");
+  assert.equal(reduceMeter(adopted, { t: "model_changed", model: "m2" }).thinkingExcluded, false);
+});
+
+test("three consecutive inclusive steps revoke the verdict and excluding evidence re-arms it", () => {
+  let s = startTurn();
+  s = reduceMeter(s, { t: "model_changed", model: "m" });
+  s = reduceMeter(s, { t: "text", at: 500, key: "r1", text: "t".repeat(2400), kind: "reasoning" });
+  s = reduceMeter(s, { t: "text", at: 700, key: "m1", text: "a".repeat(30) });
+  s = reduceMeter(s, { t: "usage", at: 800, usage: { output: 47 } });
+  assert.equal(s.thinkingExcluded, true);
+  // The provider config now includes thinking: reported output covers the
+  // streamed reasoning characters.
+  s = reduceMeter(s, { t: "text", at: 900, key: "r2", text: "y".repeat(370), kind: "reasoning" });
+  s = reduceMeter(s, { t: "usage", at: 1900, usage: { output: 197 } });
+  assert.equal(s.thinkingExcluded, true);
+  s = reduceMeter(s, { t: "text", at: 2000, key: "r3", text: "y".repeat(370), kind: "reasoning" });
+  s = reduceMeter(s, { t: "usage", at: 3000, usage: { output: 347 } });
+  assert.equal(s.thinkingExcluded, true);
+  // A thin step (too few reasoning chars for either verdict) breaks the
+  // streak: the count must start over.
+  s = reduceMeter(s, { t: "text", at: 3100, key: "r4", text: "y".repeat(100), kind: "reasoning" });
+  s = reduceMeter(s, { t: "usage", at: 3500, usage: { output: 367 } });
+  assert.equal(s.thinkingExcluded, true);
+  s = reduceMeter(s, { t: "text", at: 3600, key: "r5", text: "y".repeat(370), kind: "reasoning" });
+  s = reduceMeter(s, { t: "usage", at: 4600, usage: { output: 517 } });
+  s = reduceMeter(s, { t: "text", at: 4700, key: "r6", text: "y".repeat(370), kind: "reasoning" });
+  s = reduceMeter(s, { t: "usage", at: 5700, usage: { output: 667 } });
+  assert.equal(s.thinkingExcluded, true);
+  s = reduceMeter(s, { t: "text", at: 5800, key: "r7", text: "y".repeat(370), kind: "reasoning" });
+  s = reduceMeter(s, { t: "usage", at: 6800, usage: { output: 817 } });
+  assert.equal(s.thinkingExcluded, false);
+  assert.equal(summarizeTurn(s, CPT, 6900).thinkingTokens, 0);
+  // Excluding evidence lands: the verdict is back on the next step.
+  s = reduceMeter(s, { t: "text", at: 6900, key: "r8", text: "t".repeat(2400), kind: "reasoning" });
+  s = reduceMeter(s, { t: "usage", at: 7800, usage: { output: 867 } });
+  assert.equal(s.thinkingExcluded, true);
+});
+
+test("ordinary reasoning density revokes the verdict; the neutral band concludes nothing", () => {
+  let s = startTurn();
+  s = reduceMeter(s, { t: "model_changed", model: "m" });
+  s = reduceMeter(s, { t: "text", at: 500, key: "r1", text: "t".repeat(2400), kind: "reasoning" });
+  s = reduceMeter(s, { t: "usage", at: 1600, usage: { output: 47 } });
+  assert.equal(s.thinkingExcluded, true);
+  // A step at 6 chars per output token sits in the neutral band
+  // (inclusion ratio ~5.2, exclusion ratio 8): verdict stays, streak resets.
+  s = reduceMeter(s, { t: "text", at: 2000, key: "r2", text: "y".repeat(1200), kind: "reasoning" });
+  s = reduceMeter(s, { t: "usage", at: 3000, usage: { output: 247 } });
+  assert.equal(s.thinkingExcluded, true);
+  // Typical reasoning prose (~3.7 chars/token) now satisfies inclusion; the
+  // neutral step above must not have counted, so three full steps are needed.
+  s = reduceMeter(s, { t: "text", at: 3100, key: "r3", text: "y".repeat(740), kind: "reasoning" });
+  s = reduceMeter(s, { t: "usage", at: 4100, usage: { output: 447 } });
+  assert.equal(s.thinkingExcluded, true);
+  s = reduceMeter(s, { t: "text", at: 4200, key: "r4", text: "y".repeat(740), kind: "reasoning" });
+  s = reduceMeter(s, { t: "usage", at: 5200, usage: { output: 647 } });
+  assert.equal(s.thinkingExcluded, true);
+  s = reduceMeter(s, { t: "text", at: 5300, key: "r5", text: "y".repeat(740), kind: "reasoning" });
+  s = reduceMeter(s, { t: "usage", at: 6300, usage: { output: 847 } });
+  assert.equal(s.thinkingExcluded, false);
+});
+
+test("a verdict without a model owner is re-derived on the next turn", () => {
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 500, key: "r1", text: "y".repeat(600), kind: "reasoning" });
+  s = reduceMeter(s, { t: "usage", at: 600, usage: { output: 10 } });
+  assert.equal(s.thinkingExcluded, true);
+  assert.equal(s.thinkingExcludedModel, null);
+  // Identity never resolved: the verdict cannot be permanent across turns.
+  s = startTurn(s, 5000);
+  assert.equal(s.thinkingExcluded, false);
+  // Fresh evidence in the new turn brings it right back.
+  s = reduceMeter(s, { t: "text", at: 5500, key: "r2", text: "y".repeat(600), kind: "reasoning" });
+  s = reduceMeter(s, { t: "usage", at: 5600, usage: { output: 20 } });
+  assert.equal(s.thinkingExcluded, true);
+});
+
+test("moderate reasoning leaves the provider unjudged and adds no estimate", () => {
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 500, key: "r1", text: "y".repeat(150), kind: "reasoning" });
+  s = reduceMeter(s, { t: "usage", at: 600, usage: { output: 10 } });
+  assert.equal(s.thinkingExcluded, false);
+  assert.equal(summarizeTurn(s, CPT, 600).thinkingTokens, 0);
+});
+
+test("late bulk reasoning counts in totals but not in the decode rate", () => {
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m1", text: "a".repeat(40) });
+  // The finished reasoning block is delivered in one burst, after the answer
+  // was already streaming: its generation time is outside the window.
+  s = reduceMeter(s, { t: "text", at: 2000, key: "reasoning:t1", text: "t".repeat(2400), kind: "reasoning" });
+  s = reduceMeter(s, { t: "usage", at: 2100, usage: { output: 10 } });
+  assert.equal(s.thinkingExcluded, true);
+  assert.equal(s.steps[0].thinkingLateChars, 2400);
+  const sum = summarizeTurn(s, CPT, 2100);
+  assert.equal(sum.thinkingTokens, 2400 / REASONING_CHARS_PER_TOKEN);
+  assert.equal(sum.estTokens, 10 + 2400 / REASONING_CHARS_PER_TOKEN);
+  // Decode sees 10 visible tokens in 1100ms; the windowless thinking cannot
+  // inflate it, while the whole-turn rate does count it.
+  assert.equal(sum.tokPerSecDecode, 10 / 1.1);
+  assert.equal(sum.tokPerSecTurn, (10 + 2400 / REASONING_CHARS_PER_TOKEN) / 2.1);
+});
+
+test("no-usage estimation ignores bulk reasoning characters", () => {
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 100, key: "m1", text: "a".repeat(400) });
+  s = reduceMeter(s, { t: "text", at: 150, key: "r1", text: "t".repeat(1600), kind: "reasoning" });
+  s = reduceMeter(s, { t: "turn_ended", at: 2000, kind: "completed" });
+  // The reasoning burst arrived after the visible text had started, so its
+  // characters cannot stand in for streamed live tokens.
+  assert.equal(summarizeTurn(s, CPT, 2000).estTokens, 100);
+});
+
+test("a rejected usage burst is kept as unattributed in the turn totals", () => {
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 100, key: "m1", text: "a" });
+  s = reduceMeter(s, { t: "usage", at: 1100, usage: { output: 30 } });
+  // Aggregated usage arriving 20ms after the previous snapshot: 1200 tokens
+  // in a physically impossible window.
+  s = reduceMeter(s, { t: "usage", at: 1120, usage: { output: 1230 } });
+  assert.equal(s.steps.length, 1);
+  assert.equal(s.unattributedTokens, 1200);
+  const sum = summarizeTurn(s, CPT, 1120);
+  assert.equal(sum.outTokens, 30);
+  assert.equal(sum.unattributedTokens, 1200);
+  assert.equal(sum.estTokens, 1230);
+  // The decode-window rate ignores the windowless burst; the whole-turn rate
+  // counts it.
+  assert.equal(sum.tokPerSecDecode, 30 / 1);
+  assert.equal(sum.tokPerSecTurn, 1230 / 1.12);
+});
+
+test("an open step's running window counts in the decode rate", () => {
+  let s = startTurn();
+  // Closed step: 10 reported tokens over a 100ms window.
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m1", text: "a".repeat(40) });
+  s = reduceMeter(s, { t: "usage", at: 1100, usage: { output: 10 } });
+  // Current step: a long early reasoning stream, still open 40s later. Its
+  // estimated tokens sit in the totals, so its running window must sit in
+  // the decode denominator — dividing them by the closed 100ms window alone
+  // used to print a >10k tok/s burst on the pill.
+  s = reduceMeter(s, { t: "text", at: 2000, key: "r1", text: "t".repeat(4000), kind: "reasoning" });
+  const sum = summarizeTurn(s, CPT, 42000);
+  assert.equal(sum.decodeMs, 40100);
+  assert.equal(sum.tokPerSecDecode, (10 + 4000 / REASONING_CHARS_PER_TOKEN) / 40.1);
+});
+
+test("calibration pairs only visible characters with output tokens", () => {
+  let s = startTurn();
+  s = reduceMeter(s, { t: "text", at: 500, key: "r1", text: "y".repeat(400), kind: "reasoning" });
+  s = reduceMeter(s, { t: "text", at: 5600, key: "m1", text: "v".repeat(800) });
+  s = reduceMeter(s, { t: "usage", at: 5700, usage: { output: 200 } });
+  assert.deepEqual(s.calibInput, { chars: 800, tokens: 200 });
+});
+
+test("reasoning and visible characters are estimated with their own ratios", () => {
+  let s = startTurn();
+  // Closed step: 370 reasoning chars (early) + 10 reported output tokens.
+  s = reduceMeter(s, { t: "text", at: 100, key: "r1", text: "t".repeat(370), kind: "reasoning" });
+  s = reduceMeter(s, { t: "text", at: 200, key: "m1", text: "a".repeat(40) });
+  s = reduceMeter(s, { t: "usage", at: 300, usage: { output: 10 } });
+  assert.equal(s.thinkingExcluded, true);
+  // Open step: reasoning leads again, then visible text streams.
+  s = reduceMeter(s, { t: "text", at: 400, key: "r2", text: "t".repeat(370), kind: "reasoning" });
+  s = reduceMeter(s, { t: "text", at: 500, key: "m2", text: "a".repeat(40) });
+  const sum = summarizeTurn(s, CPT, 600);
+  const closedThinking = 370 / REASONING_CHARS_PER_TOKEN;
+  const liveThinking = 370 / REASONING_CHARS_PER_TOKEN;
+  const liveVisible = 40 / CPT;
+  assert.equal(sum.thinkingTokens, closedThinking + liveThinking);
+  assert.equal(sum.estTokens, 10 + closedThinking + liveVisible + liveThinking);
 });

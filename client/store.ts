@@ -4,6 +4,7 @@ import {
   reduceMeter,
   summarizeTurn,
   DEFAULT_CHARS_PER_TOKEN,
+  REASONING_CHARS_PER_TOKEN,
   type MeterAction,
   type MeterState,
   type TurnSummary,
@@ -47,7 +48,7 @@ export interface AgentSpeedStore {
   readonly everSawUsage: boolean;
   setIdentity(provider: string | null | undefined, model: string | null | undefined): void;
   dispatch(action: MeterAction): void;
-  liveTokPerSec(windowSec: number): number | null;
+  liveTokPerSec(windowSec: number, maxTokPerSec?: number): number | null;
   summary(now?: number): TurnSummary;
   isRunning(): boolean;
 }
@@ -124,8 +125,14 @@ export function createAgentSpeedStore(deps: AgentSpeedStoreDeps): AgentSpeedStor
       const resolvedProvider = nextProvider ?? provider;
       const resolvedModel = nextModel ?? model;
       if (resolvedProvider === provider && resolvedModel === model) return;
+      const modelChanged = resolvedModel !== null && resolvedModel !== model;
       provider = resolvedProvider;
       model = resolvedModel;
+      // The exclusion verdict is a property of the model behind the agent:
+      // switching models clears it in the reducer. A not-yet-known identity
+      // dispatches nothing, so the first `setIdentity(…, null)` cannot undo
+      // a verdict learned earlier.
+      if (modelChanged) store.dispatch({ t: "model_changed", model: resolvedModel });
       emit();
     },
     dispatch(action) {
@@ -134,12 +141,26 @@ export function createAgentSpeedStore(deps: AgentSpeedStoreDeps): AgentSpeedStor
       if (action.t === "usage" && action.usage.output != null) everSawUsage = true;
       if (next === state) return;
       state = next;
+      if (action.t === "model_changed") {
+        console.log(
+          `turn-speed: model [${deps.agentId.slice(0, 8)}] now=${action.model ?? "?"}` +
+            ` thinking-verdict=${next.thinkingExcluded ? "excluded" : "unknown"}` +
+            `${next.thinkingExcludedModel ? ` (learned on ${next.thinkingExcludedModel})` : ""}`,
+        );
+      }
       if (next.steps.length > prev.steps.length) {
         const step = next.steps[next.steps.length - 1];
-        const rate = step.decodeMs > 0 ? (step.outTokens / (step.decodeMs / 1000)).toFixed(1) : "inf";
+        const thinking = next.thinkingExcluded
+          ? (step.thinkingChars - step.thinkingLateChars) / REASONING_CHARS_PER_TOKEN
+          : 0;
+        const rate =
+          step.decodeMs > 0 ? ((step.outTokens + thinking) / (step.decodeMs / 1000)).toFixed(1) : "inf";
+        const thinkPart =
+          step.thinkingChars > 0 ? ` thinkChars=${step.thinkingChars} think~${Math.round(thinking)}` : "";
         console.log(
-          `turn-speed: step ok [${deps.agentId.slice(0, 8)}] out=${step.outTokens} in=${step.inputTokens}` +
-            ` cached=${step.cachedTokens} decodeMs=${Math.round(step.decodeMs)} waitMs=${Math.round(step.waitMs)} rate=${rate}`,
+          `turn-speed: step ok [${deps.agentId.slice(0, 8)}] out=${step.outTokens}${thinkPart} in=${step.inputTokens}` +
+            ` cached=${step.cachedTokens} decodeMs=${Math.round(step.decodeMs)} waitMs=${Math.round(step.waitMs)}` +
+            ` rate=${rate} verdict=${next.thinkingExcluded ? "excluded" : "off"}`,
         );
       }
       if (next.stepRejected) {
@@ -149,7 +170,7 @@ export function createAgentSpeedStore(deps: AgentSpeedStoreDeps): AgentSpeedStor
           console.log(
             `turn-speed: step dropped as implausible [${deps.agentId.slice(0, 8)}]` +
               ` tokens=${next.stepRejected.tokens} windowMs=${Math.round(next.stepRejected.windowMs)}` +
-              " (likely a previous message's late usage; absorbed into the baseline)",
+              " (late or aggregated usage; kept in the turn totals as unattributed tokens)",
           );
         }
       }
@@ -165,7 +186,7 @@ export function createAgentSpeedStore(deps: AgentSpeedStoreDeps): AgentSpeedStor
       pushSample();
       emit();
     },
-    liveTokPerSec(windowSec) {
+    liveTokPerSec(windowSec: number, maxTokPerSec?: number) {
       const windowMs = Math.max(0.5, windowSec) * 1000;
       const at = now();
       const cutoff = at - windowMs;
@@ -186,7 +207,11 @@ export function createAgentSpeedStore(deps: AgentSpeedStoreDeps): AgentSpeedStor
       if (spanMs < 250) return null;
       const tokens = last.est - first.est;
       if (tokens <= 0) return null;
-      return tokens / (spanMs / 1000);
+      const rate = tokens / (spanMs / 1000);
+      // Beyond the plausibility cap the window holds a bookkeeping jump
+      // (aggregated usage, reasoning bulk), not streaming speed: no number.
+      if (maxTokPerSec !== undefined && rate > maxTokPerSec) return null;
+      return rate;
     },
     summary,
     isRunning() {
