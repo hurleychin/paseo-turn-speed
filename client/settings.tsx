@@ -72,6 +72,12 @@ export function makeSettingsScreen(onSaved: () => void): ComponentType<PluginSur
               ]}
               onValueChange={(v) => save({ numerator: v })}
             />
+            <SettingsSwitch
+              label="Show cache hit rate in the pill"
+              hint="Appends the turn's prompt cache hit rate to the composer pill. The popover always shows it."
+              value={values.showCacheInPill}
+              onValueChange={(v) => save({ showCacheInPill: v })}
+            />
             <SettingsSelect
               label="Token format"
               value={values.tokenFormat}
@@ -146,6 +152,24 @@ export function makeSettingsScreen(onSaved: () => void): ComponentType<PluginSur
               }}
             />
             {settings.saveError ? <Text style={error}>{settings.saveError}</Text> : null}
+          </SettingsCard>
+        </SettingsSection>
+        <SettingsSection
+          title="Prompt cache"
+          info="Hit rate = cache reads / (new input + cache writes + cache reads), summed over the turn's model calls. Paseo does not report cache writes, so that term is currently always 0."
+        >
+          <SettingsCard>
+            <SettingsSelect
+              label="How cache reads are reported"
+              hint="Auto infers from the numbers (cache reads larger than the prompt can only mean separate counters). Claude reports cache reads on top of the prompt; most OpenAI-compatible providers fold them in."
+              value={values.cacheCounting}
+              options={[
+                { label: "Auto (default)", value: "auto" },
+                { label: "Included in prompt (OpenAI-style)", value: "inclusive" },
+                { label: "Separate from prompt (Anthropic-style)", value: "separate" },
+              ]}
+              onValueChange={(v) => save({ cacheCounting: v })}
+            />
           </SettingsCard>
         </SettingsSection>
         <SettingsSection title="Calibration" info="Learned per model from real usage: chars per output token, blended 0.7/0.3 and clamped to 2..8.">

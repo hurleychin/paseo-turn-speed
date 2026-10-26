@@ -366,6 +366,7 @@ export default function contribute(client: PluginClientContext) {
       charsPerToken: (model) => effectiveCpt(model),
       learnedCharsPerToken: (model) => calibration.get(model),
       onCalibration,
+      cacheCounting: () => prefs.cacheCounting,
       now: () => Date.now(),
     });
     store.setIdentity(agent.provider, agent.model ?? null);

@@ -1,5 +1,5 @@
 import type { PluginButton, PluginButtonRegistration } from "@getpaseo/plugin/client";
-import { approx, fmtDuration, fmtRate, fmtTokens } from "./format";
+import { approx, fmtDuration, fmtPercent, fmtRate, fmtTokens } from "./format";
 import type { AgentSpeedStore } from "./store";
 import type { TeamView } from "./team";
 import type { Preferences } from "../shared/preferences";
@@ -52,11 +52,15 @@ export function computePillView(
   const running = phase === "running";
   const waiting = summary.waiting;
   const teamRunning = team && phase === "running" && team.running > 0 ? team : null;
-  // The composer track is narrow: the pill carries the decode rate only, and
-  // the turn state (live vs waiting) is shown solely by the leading icon.
+  // The composer track is narrow: the pill carries the decode rate plus the
+  // turn's cache hit rate (when enabled) and the subagent count (when the work
+  // is delegated); turn state (live vs waiting) is shown by the leading icon.
   // Tokens, prefill and wait time live in the popover; the full picture goes
   // into the accessible title.
   const labelParts: string[] = [rateText];
+  if (prefs.showCacheInPill && summary.cacheHitRate !== null) {
+    labelParts.push(`\u00b7 ${fmtPercent(summary.cacheHitRate)} cached`);
+  }
   if (teamRunning) labelParts.push(`\u00b7 ${teamRunning.running} sub`);
   if (phase === "failed") labelParts.push("\u00b7 failed");
   if (phase === "canceled") labelParts.push("\u00b7 canceled");
@@ -76,6 +80,7 @@ export function computePillView(
     titleParts.push(`${approx(fmtTokens(summary.estTokens, prefs.tokenFormat), isApprox)} tok`);
   }
   if (summary.prefillMs !== null) titleParts.push(`TTFT ${fmtDuration(summary.prefillMs)}`);
+  if (summary.cacheHitRate !== null) titleParts.push(`cache ${fmtPercent(summary.cacheHitRate)}`);
   return {
     label: labelParts.join(" "),
     icon: waiting ? "Pause" : running ? "Zap" : "Activity",

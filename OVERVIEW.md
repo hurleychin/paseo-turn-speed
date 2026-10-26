@@ -2,8 +2,8 @@
 
 A composer pill on every agent that shows how fast the model is decoding: live
 tok/s while a turn runs, final tok/s and token totals after it, and a popover
-with the breakdown — prefill/TTFT, in/cached/out tokens, model-call steps, tool
-wait time, and context occupancy.
+with the breakdown — prefill/TTFT, in/out tokens, prompt cache hit rate,
+model-call steps, tool wait time, and context occupancy.
 
 Speed is measured over decode windows only: tool waits, long pauses, and prompt
 prefill are separated out, so the number reflects generation speed rather than
@@ -20,8 +20,9 @@ config that starts including thinking revokes it, so nothing is double-counted.
 
 Options live under Settings → Plugins → Turn speed: what the pill leads with
 (live estimate, decode-window average, or whole-turn rate, switchable from the
-popover), smoothing window for the live number, token format, idle-pill
-visibility, and a manual chars/token override. Requires Paseo 0.11 or later;
+popover), smoothing window for the live number, token format, whether the pill
+carries the cache hit rate, idle-pill visibility, and a manual chars/token
+override. Requires Paseo 0.11 or later;
 see the README for installing from GitHub or npm.
 Turns are observed live; history from before a plugin reload is not
 reconstructed. Subagents keep their own pills, but the parent also knows about
