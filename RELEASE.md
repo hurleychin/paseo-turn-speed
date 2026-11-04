@@ -9,7 +9,6 @@ How to ship a new version of this plugin and keep the three listings in sync.
 | GitHub | `main` + version tags | push |
 | npm [`paseo-turn-speed`](https://www.npmjs.com/package/paseo-turn-speed) | `npm publish` | manual |
 | Official [paseo.sh/plugins](https://paseo.sh/plugins) | npm artifact ([submission #475](https://github.com/getpaseo/plugins/issues/475), merged via PR #476) | bot opens a bump PR on each npm release; a reviewer merges |
-| Community [paseo.cafe](https://paseo.cafe) | `registry/turn-speed.json` ([submission #380](https://github.com/paseo-cafe/paseo-cafe/issues/380), merged via PR #381) | scans refresh ~every 6 h; no action needed |
 
 Local development stays on the directory source (`paseo plugin install "$(pwd)"`);
 public installs use `npm:paseo-turn-speed`.
@@ -53,27 +52,23 @@ public installs use `npm:paseo-turn-speed`.
   the link promptly. Without a TTY, wrap it in a PTY (`expect`) so the
   "Press ENTER to open in the browser..." prompt gets answered.
 
-## Manifest restrictions from the paseo.cafe scanner
+## Registry conventions (history)
 
-The cafe security scanner
-([scripts/plugin-security/static-scan.ts](https://github.com/paseo-cafe/paseo-cafe/blob/main/scripts/plugin-security/static-scan.ts))
-only allows these top-level `paseo-plugin.json` keys: `id`, `description`,
-`requirements`, `build`. Anything else is a blocking finding.
+paseo.cafe — the community registry this plugin was listed on until it shut
+down — had a security scanner that only allowed the top-level
+`paseo-plugin.json` keys `id`, `description`, `requirements`, `build`. The
+manifest is still trimmed to that allow-list: Paseo itself supports `name`,
+`icon` and `media` (see `PluginManifestSchema` in `@getpaseo/server`) and
+`assets/icon.png` is ready, but returning those fields to the manifest is
+deliberately deferred until the official registry is checked with them.
 
-Paseo 0.11.2 itself supports `name`, `icon` and `media` (see
-`PluginManifestSchema` in `@getpaseo/server`), but they are kept out of the
-manifest so the cafe scanner stays green. `assets/icon.png` is ready for the
-day the scanner allow-list catches up.
+Validation rules the registries enforce (worth keeping either way):
 
-Other registry-validation rules that bit us:
-
-- The cafe `npm package` form field is copied verbatim — submit the exact
-  unscoped name `paseo-turn-speed` (a scoped guess 404s and fails validation).
 - `OVERVIEW.md` must not contain the strings `paseo plugin add`,
   `npm install`, `npm i` (registry docs belong in the README).
 - The README keeps an `## Install` section and a `## Known limitations`
-  section — cafe detects those headings and pulls them into the listing — plus
-  an `images/` folder for screenshots.
+  section — the registries detect those headings and pull them into the
+  listing — plus an `images/` folder for screenshots.
 
 ## History
 
@@ -96,3 +91,13 @@ Other registry-validation rules that bit us:
   `AgentUsage.reasoningTokens` request (getpaseo/paseo discussion #7863) from
   Known limitations, so registry listings carry the upvote target. Session
   still warm from v1.2.0; publish still required its own `/auth/cli/` passkey.
+- 2026-11-02 — paseo.cafe shut down: community listing dropped from the
+  release process and from the listings table; its scanner-specific manifest
+  restrictions are kept only as history (see Registry conventions).
+- 2026-11-02 — v1.3.0 published: prompt cache hit rate in the pill and
+  popover (PR #1: `showCacheInPill` and `cacheCounting` preferences,
+  auto/inclusive/separate detection), and turn-window reconciliation
+  (PR #2: the clock anchors to the `turn_started` event timestamp, mid-turn
+  attach seeds only after the subscription is ready, and a snapshot closes a
+  turn whose terminal event was lost provisionally). Both PRs were external
+  contributions; the combined tree verified at 98 tests.

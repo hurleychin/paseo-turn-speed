@@ -4,6 +4,10 @@ import { createAgentSpeedStore, type AgentSpeedStore } from "./client/store";
 import { bindPill } from "./client/pill";
 import { makeSpeedDetails } from "./client/details";
 import { parentAgentIdOf } from "./client/links";
+import {
+  reconcileSnapshot,
+  turnStartFromEvent,
+} from "./client/lifecycle";
 import { summarizeTeam, type TeamMemberInput } from "./client/team";
 import { makeSettingsScreen } from "./client/settings";
 import {
@@ -61,6 +65,19 @@ export default function contribute(client: PluginClientContext) {
   const aborted = () => lifetime.signal.aborted;
   const logError = (...args: unknown[]) => {
     if (!aborted()) console.error("turn-speed:", ...args);
+  };
+  /** A terminal event for a turn this meter never followed (its start was
+   * lost) must not close the current turn, replace its outcome, or clear the
+   * waits and tool calls that belong to it. An empty id is no id: the reducer
+   * treats it the same way. */
+  const belongsToCurrentTurn = (
+    store: AgentSpeedStore,
+    turnId: string | null | undefined,
+  ): boolean => {
+    const id = turnId || null;
+    if (id === null) return true;
+    const current = store.state.turnId;
+    return current === null || current === id;
   };
 
   const notifyTeam = (parentId: string): void => {
@@ -231,8 +248,8 @@ export default function contribute(client: PluginClientContext) {
 
   function onStreamEvent(
     store: AgentSpeedStore,
-    handle: AgentHandle,
     event: StreamEvent,
+    eventTimestamp: string | null | undefined,
     reseed: () => void,
     waits: Set<string>,
     agentId: string,
@@ -244,23 +261,27 @@ export default function contribute(client: PluginClientContext) {
       case "turn_started": {
         waits.clear();
         subCalls.clear();
-        const startedAt = handle.activeTurn?.startedAt;
-        const parsed = startedAt ? Date.parse(startedAt) : Number.NaN;
+        // Anchor to the daemon's timestamp from this very message: a ref()
+        // snapshot updates on another channel and can still hold the previous
+        // turn's start, which would charge that whole turn to this one.
+        const start = turnStartFromEvent(eventTimestamp, at);
         store.dispatch({
           t: "turn_started",
-          at: Number.isFinite(parsed) ? parsed : at,
-          turnId: event.turnId ?? handle.activeTurn?.turnId ?? null,
+          at: start.at,
+          turnId: event.turnId || null,
         });
         onSubChange();
         break;
       }
       case "turn_completed":
+        if (!belongsToCurrentTurn(store, event.turnId)) break;
         waits.clear();
         subCalls.clear();
         store.dispatch({
           t: "turn_ended",
           at,
           kind: "completed",
+          turnId: event.turnId || null,
           usage: event.usage ? mapUsage(event.usage) : undefined,
           maxTokPerSec: prefs.maxPlausibleTokPerSec,
         });
@@ -268,15 +289,29 @@ export default function contribute(client: PluginClientContext) {
         void refreshPrefs();
         break;
       case "turn_failed":
+        if (!belongsToCurrentTurn(store, event.turnId)) break;
         waits.clear();
         subCalls.clear();
-        store.dispatch({ t: "turn_ended", at, kind: "failed", note: event.error });
+        store.dispatch({
+          t: "turn_ended",
+          at,
+          kind: "failed",
+          turnId: event.turnId || null,
+          note: event.error,
+        });
         onSubChange();
         break;
       case "turn_canceled":
+        if (!belongsToCurrentTurn(store, event.turnId)) break;
         waits.clear();
         subCalls.clear();
-        store.dispatch({ t: "turn_ended", at, kind: "canceled", note: event.reason });
+        store.dispatch({
+          t: "turn_ended",
+          at,
+          kind: "canceled",
+          turnId: event.turnId || null,
+          note: event.reason,
+        });
         onSubChange();
         break;
       case "permission_requested":
@@ -392,56 +427,15 @@ export default function contribute(client: PluginClientContext) {
     // triggered the attach, then from the handle when it is populated.
     observeUsage(agent.lastUsage ?? null);
     observeUsage(handle.lastUsage);
-    // Open permission/question requests: non-empty means the model is
-    // blocked on the user and the meter must not charge that time to it.
+    // Open permission/question requests, tracked so stream events do not
+    // dispatch the same transition twice.
     const pendingWaits = new Set<string>();
-    const syncWaits = (snapshot: {
-      pendingPermissions?: readonly { id: string }[] | null;
-    }): void => {
-      const pending = snapshot.pendingPermissions;
-      if (!pending) return;
-      pendingWaits.clear();
-      for (const request of pending) pendingWaits.add(request.id);
-      store.dispatch({
-        t: pendingWaits.size > 0 ? "user_wait_started" : "user_wait_ended",
-        at: Date.now(),
-      });
-    };
-    syncWaits(agent);
-    // Attaching mid-turn (agent created before the plugin loaded, or a fresh
-    // agent whose turn_started raced the subscription): start the meter from
-    // the snapshot so the pill exists for the rest of that turn.
-    const seedTurn = (snapshot: {
-      status?: string | null;
-      activeTurn?: { turnId?: string | null; startedAt?: string | null } | null;
-    }): void => {
-      if (store.state.phase !== "idle" || snapshot.status !== "running" || !snapshot.activeTurn) return;
-      const raw = snapshot.activeTurn.startedAt;
-      const parsed = raw ? Date.parse(raw) : Number.NaN;
-      store.dispatch({
-        t: "turn_started",
-        at: Number.isFinite(parsed) ? parsed : Date.now(),
-        turnId: snapshot.activeTurn.turnId ?? null,
-      });
-    };
-    seedTurn(agent);
-    // A ref() handle starts empty: without a real snapshot, the first usage
-    // event after a reload would count the session-cumulative counters as
-    // one giant step. Fetch the truth for that case.
-    const reseed = (): void => {
-      void handle
-        .refresh()
-        .then((result) => {
-          const snapshot = result?.agent;
-          if (!snapshot || attached.get(agent.id)?.store !== store) return;
-          store.setIdentity(snapshot.provider, snapshot.model ?? null);
-          observeUsage(snapshot.lastUsage ?? null);
-          syncWaits(snapshot);
-          seedTurn(snapshot);
-        })
-        .catch((error) => logError(`usage reseed failed for ${agent.id}`, error));
-    };
-    reseed();
+    // Live events are only delivered after the timeline subscription is
+    // established, and the daemon keeps no replay: anything that happens
+    // before `ready` is invisible. Seeding a turn before then is what leaves
+    // a turn that ends inside that window running forever, so seeding waits
+    // for `ready` and takes its snapshot afterwards.
+    let listening = false;
 
     // Delegation: open sub_agent tool calls (or linked children that are
     // running) mean the agent's own model is idle while subagents work, so
@@ -470,6 +464,45 @@ export default function contribute(client: PluginClientContext) {
       console.log(`turn-speed: delegation ${should ? "on" : "off"} [${agent.id.slice(0, 8)}]`);
       store.dispatch({ t: should ? "delegated_started" : "delegated_ended", at: Date.now() });
     };
+    // One snapshot, one ordered set of actions: identify the turn, restore the
+    // waits that belong to it, then end a turn whose terminal event was lost.
+    // The last step is provisional, so a real terminal event still decides the
+    // outcome.
+    function reconcile(snapshot: AgentSnapshot): void {
+      const result = reconcileSnapshot(store.state, snapshot, Date.now(), { seed: listening });
+      if (result.pendingWaits) {
+        pendingWaits.clear();
+        for (const requestId of result.pendingWaits) pendingWaits.add(requestId);
+      }
+      for (const action of result.actions) {
+        store.dispatch(action);
+        if (action.t === "turn_ended" && action.provisional) {
+          subCalls.clear();
+          void refreshPrefs();
+        }
+      }
+      // Re-evaluate the delegation after the snapshot: it may have just
+      // established the turn, and children that are already running must park
+      // that time instead of charging it to the parent. Without this, a parent
+      // that attaches after its children would count their work as its own
+      // until the next child event.
+      syncDelegated();
+    }
+    // A ref() handle starts empty: without a real snapshot, the first usage
+    // event after a reload would count the session-cumulative counters as
+    // one giant step. Fetch the truth for that case.
+    function reseed(): void {
+      void handle
+        .refresh()
+        .then((result) => {
+          const snapshot = result?.agent;
+          if (!snapshot || attached.get(agent.id)?.store !== store) return;
+          store.setIdentity(snapshot.provider, snapshot.model ?? null);
+          observeUsage(snapshot.lastUsage ?? null);
+          reconcile(snapshot);
+        })
+        .catch((error) => logError(`usage reseed failed for ${agent.id}`, error));
+    }
     const team = () => {
       const view = summarizeTeam(
         teamMembers(agent.id),
@@ -525,19 +558,36 @@ export default function contribute(client: PluginClientContext) {
       remember(snapshot);
       store.setIdentity(snapshot.provider, snapshot.model ?? null);
       observeUsage(snapshot.lastUsage ?? null);
-      syncWaits(snapshot);
-      seedTurn(snapshot);
+      reconcile(snapshot);
       if (snapshot.archivedAt || snapshot.status === "closed") detach(agent.id);
     });
 
     const timelineSub = handle.timeline.subscribe((event) => {
       try {
-        onStreamEvent(store, handle, event.event, reseed, pendingWaits, agent.id, subCalls, syncDelegated);
+        onStreamEvent(
+          store,
+          event.event,
+          "timestamp" in event ? event.timestamp : null,
+          reseed,
+          pendingWaits,
+          agent.id,
+          subCalls,
+          syncDelegated,
+        );
       } catch (error) {
         logError(`timeline event failed for ${agent.id}`, error);
       }
     });
-    void timelineSub.ready.catch((error) => logError(`timeline subscribe failed for ${agent.id}`, error));
+    void timelineSub.ready
+      .then(() => {
+        if (aborted() || attached.get(agent.id)?.store !== store) return;
+        listening = true;
+        // Live delivery is guaranteed from here on, and a fresh snapshot
+        // recovers whatever happened before it: start and terminal events can
+        // no longer fall into an uncovered window.
+        reseed();
+      })
+      .catch((error) => logError(`timeline subscribe failed for ${agent.id}`, error));
 
     attached.set(agent.id, {
       store,

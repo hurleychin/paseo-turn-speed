@@ -765,3 +765,168 @@ test("reasoning and visible characters are estimated with their own ratios", () 
   assert.equal(sum.thinkingTokens, closedThinking + liveThinking);
   assert.equal(sum.estTokens, 10 + closedThinking + liveVisible + liveThinking);
 });
+
+test("a provisional end still lets the real terminal event decide the outcome", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, {
+    t: "turn_ended",
+    at: 1000,
+    kind: "completed",
+    turnId: "t1",
+    provisional: true,
+  });
+  assert.equal(s.phase, "completed");
+  assert.equal(s.provisional, true);
+  assert.equal(s.endedAt, 1000);
+  // The agent snapshot only knew that work stopped; the failure still lands.
+  s = reduceMeter(s, { t: "turn_ended", at: 1100, kind: "failed", note: "boom", turnId: "t1" });
+  assert.equal(s.phase, "failed");
+  assert.equal(s.endNote, "boom");
+  assert.equal(s.endedAt, 1100);
+  assert.equal(s.provisional, false);
+});
+
+test("a provisional end is replaced by a completed terminal with its usage", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "turn_ended", at: 1000, kind: "completed", turnId: "t1", provisional: true });
+  s = reduceMeter(s, {
+    t: "turn_ended",
+    at: 1200,
+    kind: "completed",
+    turnId: "t1",
+    usage: { output: 40, input: 10 },
+  });
+  assert.equal(s.phase, "completed");
+  assert.equal(s.provisional, false);
+  assert.equal(s.endedAt, 1200);
+  // The terminal payload still refreshes the counters and their baseline.
+  assert.equal(s.usageOut, 40);
+  assert.equal(s.prevUsageOut, 40);
+});
+
+test("a terminal for another turn cannot rewrite a provisional end", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "turn_ended", at: 1000, kind: "completed", turnId: "t1", provisional: true });
+  const after = reduceMeter(s, { t: "turn_ended", at: 1100, kind: "failed", turnId: "t2" });
+  assert.equal(after, s);
+});
+
+test("a real terminal event is not rewritten by a later duplicate", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "turn_ended", at: 1000, kind: "failed", note: "boom", turnId: "t1" });
+  const after = reduceMeter(s, { t: "turn_ended", at: 1100, kind: "completed", turnId: "t1" });
+  assert.equal(after, s);
+});
+
+test("the next turn clears a provisional end", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "turn_ended", at: 1000, kind: "completed", turnId: "t1", provisional: true });
+  s = reduceMeter(s, { t: "turn_started", at: 2000, turnId: "t2" });
+  assert.equal(s.phase, "running");
+  assert.equal(s.turnId, "t2");
+  assert.equal(s.provisional, false);
+  assert.equal(s.endedAt, null);
+});
+
+test("a terminal event for another turn neither closes this turn nor advances its baseline", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m1", text: "x".repeat(400) });
+  const after = reduceMeter(s, {
+    t: "turn_ended",
+    at: 1200,
+    kind: "failed",
+    turnId: "other",
+    usage: { output: 40 },
+  });
+  assert.equal(after, s);
+  assert.equal(after.phase, "running");
+  assert.equal(after.prevUsageOut, 0);
+});
+
+test("a terminal event for another turn cannot rewrite a provisional end", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m1", text: "x".repeat(400) });
+  s = reduceMeter(s, { t: "turn_ended", at: 1100, kind: "completed", turnId: "t1", provisional: true });
+  const after = reduceMeter(s, {
+    t: "turn_ended",
+    at: 1200,
+    kind: "failed",
+    turnId: "other",
+    note: "not this turn",
+  });
+  assert.equal(after, s);
+  assert.equal(after.phase, "completed");
+  assert.equal(after.endNote, null);
+});
+
+test("a provisional end still accounts the terminal usage into the turn", () => {
+  const direct = reduceMeter(
+    reduceMeter(startTurn(initialMeterState(), 0), {
+      t: "text",
+      at: 1000,
+      key: "m1",
+      text: "x".repeat(400),
+    }),
+    { t: "turn_ended", at: 1200, kind: "completed", turnId: "t1", usage: { output: 40, input: 10 } },
+  );
+
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m1", text: "x".repeat(400) });
+  s = reduceMeter(s, { t: "turn_ended", at: 1100, kind: "completed", turnId: "t1", provisional: true });
+  s = reduceMeter(s, {
+    t: "turn_ended",
+    at: 1200,
+    kind: "completed",
+    turnId: "t1",
+    usage: { output: 40, input: 10 },
+  });
+
+  const directSum = summarizeTurn(direct, CPT, 2000);
+  const sum = summarizeTurn(s, CPT, 2000);
+  assert.equal(sum.steps, directSum.steps);
+  assert.equal(sum.steps, 1);
+  assert.equal(sum.outTokens, 40);
+  assert.equal(sum.outTokens, directSum.outTokens);
+  assert.equal(sum.decodeMs, directSum.decodeMs);
+  assert.equal(sum.tokPerSecDecode, directSum.tokPerSecDecode);
+});
+
+test("usage that arrives after a provisional end still closes the step", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m1", text: "x".repeat(400) });
+  s = reduceMeter(s, { t: "turn_ended", at: 1100, kind: "completed", turnId: "t1", provisional: true });
+  s = reduceMeter(s, { t: "usage", at: 1200, usage: { output: 40, input: 10 } });
+  // The clock stays stopped, but the tokens are counted.
+  assert.equal(s.phase, "completed");
+  assert.equal(s.provisional, true);
+  assert.equal(s.endedAt, 1100);
+  const sum = summarizeTurn(s, CPT, 2000);
+  assert.equal(sum.steps, 1);
+  assert.equal(sum.outTokens, 40);
+  assert.equal(sum.tokPerSecDecode, 200);
+});
+
+test("the terminal payload repeats no token after the usage already landed", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m1", text: "x".repeat(400) });
+  s = reduceMeter(s, { t: "turn_ended", at: 1100, kind: "completed", turnId: "t1", provisional: true });
+  s = reduceMeter(s, { t: "usage", at: 1200, usage: { output: 40 } });
+  s = reduceMeter(s, { t: "turn_ended", at: 1300, kind: "completed", turnId: "t1", usage: { output: 40 } });
+  assert.equal(s.steps.length, 1);
+  assert.equal(s.steps[0].outTokens, 40);
+  assert.equal(s.provisional, false);
+});
+
+test("an empty turn id is no id, not another turn", () => {
+  let s = startTurn(initialMeterState(), 0);
+  s = reduceMeter(s, { t: "text", at: 1000, key: "m1", text: "x".repeat(400) });
+  // The terminal carries no usable id: it must still close this turn.
+  const after = reduceMeter(s, { t: "turn_ended", at: 1200, kind: "failed", turnId: "" });
+  assert.equal(after.phase, "failed");
+  assert.equal(after.endedAt, 1200);
+});
+
+test("an empty turn id on the start is stored as no id", () => {
+  const s = reduceMeter(initialMeterState(), { t: "turn_started", at: 0, turnId: "" });
+  assert.equal(s.turnId, null);
+});

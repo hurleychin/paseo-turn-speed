@@ -16,9 +16,11 @@
     "client/format.ts",
     "client/team.ts",
     "client/links.ts",
+    "client/lifecycle.ts",
     "client/meter.test.ts",
     "client/format.test.ts",
     "client/team.test.ts",
-    "client/links.test.ts"
+    "client/links.test.ts",
+    "client/lifecycle.test.ts"
   ]
 }
